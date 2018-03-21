@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,11 +7,18 @@
 #include <sys/stat.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <errno.h>
 
+typedef unsigned long long int datatype;
+#define datatype_size sizeof(datatype)
+
+typedef uint32_t word_t;
+#define word_size sizeof(word_t)
+
 static const char * proc_name;
-static char insert_code[] = "\xcd\x80\xcc";
+static char insert_code[] = "\x0f\x05\xcc";
 
 void * get_free_space_addr(pid_t pid) {
 	FILE *fp;
@@ -34,25 +42,24 @@ void * get_free_space_addr(pid_t pid) {
 	return addr;
 }
 
-#define long_size sizeof(long)
 void getdata(pid_t child, void * addr, char *str, int len) {
 	char *laddr;
 	int i, j;
 	union u {
-			long val;
-			char chars[long_size];
+			word_t val;
+			char chars[word_size];
 	}data;
 	i = 0;
-	j = len / long_size;
+	j = len / word_size;
 	laddr = str;
 	while(i < j) {
 		data.val = ptrace(PTRACE_PEEKDATA, child,
 						  addr + i * 4, NULL);
-		memcpy(laddr, data.chars, long_size);
+		memcpy(laddr, data.chars, word_size);
 		++i;
-		laddr = ((char*)laddr) + long_size;
+		laddr = ((char*)laddr) + word_size;
 	}
-	j = len % long_size;
+	j = len % word_size;
 	if(j != 0) {
 		data.val = ptrace(PTRACE_PEEKDATA, child,
 						  addr + i * 4, NULL);
@@ -66,20 +73,20 @@ void putdata(pid_t child, const void * addr, const char *str, int len) {
 	int i;
 	int j;
 	union u {
-			long val;
-			char chars[long_size];
+			word_t val;
+			char chars[word_size];
 	} data;
 	i = 0;
-	j = len / long_size;
+	j = len / word_size;
 	laddr = str;
 	while(i < j) {
-		memcpy(data.chars, laddr, long_size);
+		memcpy(data.chars, laddr, word_size);
 		ptrace(PTRACE_POKEDATA, child,
 				addr + i * 4, data.val);
 		++i;
-		laddr += long_size;
+		laddr += word_size;
 	}
-	j = len % long_size;
+	j = len % word_size;
 	if(j != 0) {
 		memcpy(data.chars, laddr, j);
 		ptrace(PTRACE_POKEDATA, child,
@@ -106,12 +113,18 @@ int redirect_output(pid_t pid, int fd, const char * outpath) {
 	printf("Enter redirect output. pid: %u, fd: %d, size: %u, %p\n", pid, fd, size, addr);
 
 	rc = ptrace(PTRACE_ATTACH, pid, NULL, NULL);
+	if (rc) {
+		perror("attach");
+	}
 	wait(NULL);
 	printf("Attached: %d\n", rc);
 
 	rc = ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+	if (rc) {
+		perror("getregs");
+	}
 	printf("Got registers: %d\n", rc);
-	addr = (void*)regs.eip;
+	addr = (void*)regs.rip;
 	backup = malloc(size);
 	getdata(pid, addr, backup, size);
 	printf("Backed up memory\n");
@@ -126,44 +139,86 @@ int redirect_output(pid_t pid, int fd, const char * outpath) {
 	}
 	printf("\n");
 	putdata(pid, addr, outpath, outpath_len);
-	putdata(pid, addr+outpath_len, insert_code, size-outpath_len);
+	putdata(pid, addr+outpath_len, insert_code, sizeof(insert_code));
 	memcpy(&oldregs, &regs, sizeof(regs));
 
-	regs.eip = (long)(addr+outpath_len);
-	regs.eax = 5; /* Open */
-	regs.ebx = (long)addr;
-	regs.ecx = 1; /* O_WRONLY */
-	regs.edx = 0; /* mode, ignored */
+	regs.rip = (datatype)(addr+outpath_len);
+	regs.rax = 2; /* Open */
+	regs.rdi = (datatype)addr;
+	regs.rsi = O_WRONLY | O_CREAT;
+	regs.rdx = S_IRWXU | S_IRWXG | S_IRWXO; /* mode, ignored */
 	rc = ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+	if (rc) {
+		perror("setregs");
+	}
 	rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
+	if (rc) {
+		perror("cont");
+	}
 	wait(NULL);
 	rc = ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-	printf("Open: %d, %d\n", rc, regs.eax);
+	if (rc) {
+		perror("getregs (2)");
+	}
+	printf("Open: %d, %d\n", rc, regs.rax);
+	if (regs.rax > -4096u) {
+		fprintf(stderr, "Open: %s\n", strerror(-regs.rax));
+	}
 
-	regs.eip = (long)(addr+outpath_len);
-	regs.ebx = regs.eax;
-	regs.eax = 0x3f; /* dup2 */
-	regs.ecx = fd;
+	regs.rip = (datatype)(addr+outpath_len);
+	regs.rdi = regs.rax;
+	regs.rax = 33; /* dup2 */
+	regs.rsi = fd;
 	rc = ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+	if (rc) {
+		perror("setregs (2)");
+	}
 	rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
+	if (rc) {
+		perror("cont (2)");
+	}
 	wait(NULL);
 	rc = ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-	printf("Dup: %d, %d\n", rc, regs.eax);
+	if (rc) {
+		perror("getregs (3)");
+	}
+	printf("Dup: %d, %d\n", rc, regs.rax);
+	if (regs.rax > -4096u) {
+		fprintf(stderr, "Dup: %s\n", strerror(-regs.rax));
+	}
 
-	regs.eip = (long)(addr+outpath_len);
-	regs.eax = 6; /* close */
+	regs.rip = (datatype)(addr+outpath_len);
+	regs.rax = 3; /* close */
 	rc = ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+	if (rc) {
+		perror("setregs (4)");
+	}
 	rc = ptrace(PTRACE_CONT, pid, NULL, NULL);
+	if (rc) {
+		perror("cont (4)");
+	}
 	wait(NULL);
 	rc = ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-	printf("Close: %d, %d\n", rc, regs.eax);
+	if (rc) {
+		perror("getregs (4)");
+	}
+	printf("Close: %d, %d\n", rc, regs.rax);
+	if (regs.rax) {
+		fprintf(stderr, "Close: %s\n", strerror(-regs.rax));
+	}
 	
 	putdata(pid, addr, backup, size);
 	printf("Reverted data\n");
 	free(backup);
 	rc = ptrace(PTRACE_SETREGS, pid, NULL, &oldregs);
+	if (rc) {
+		perror("reset regs");
+	}
 	printf("Reset registers: %d\n", rc);
 	rc = ptrace(PTRACE_DETACH, pid, NULL, NULL);
+	if (rc) {
+		perror("detach");
+	}
 	printf("Detached: %d\n", rc);
 	return 0;
 }
